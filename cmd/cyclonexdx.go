@@ -1,9 +1,12 @@
 package cmd
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/CycloneDX/cyclonedx-go"
@@ -25,6 +28,13 @@ const (
 	NodeType      = "node"
 	ContainerType = "container"
 )
+
+// cdxNamespace is a fixed UUIDv5 namespace used to derive deterministic BOM
+// serial numbers from the BOM content. Its value is arbitrary but stable.
+var cdxNamespace = uuid.Must(uuid.FromBytes([]byte{
+	0x6b, 0x62, 0x6f, 0x6d, 0x2d, 0x63, 0x79, 0x63,
+	0x6c, 0x6f, 0x6e, 0x65, 0x64, 0x78, 0x2d, 0x31,
+}))
 
 func locationProperties(loc *model.Location) []cyclonedx.Property {
 	if loc == nil {
@@ -56,12 +66,80 @@ func locationProperties(loc *model.Location) []cyclonedx.Property {
 	return properties
 }
 
+// deterministicTimestamp returns the BOM timestamp derived from the original
+// KBOM generation time, so repeated exports of the same snapshot are identical.
+func deterministicTimestamp(kbom *model.KBOM) string {
+	if !kbom.GeneratedAt.IsZero() {
+		return kbom.GeneratedAt.UTC().Format(time.RFC3339)
+	}
+
+	return time.Now().UTC().Format(time.RFC3339)
+}
+
+// deterministicSerialNumber derives a stable UUIDv5 URN from the encoded BOM
+// content. Any change to the BOM (components, dependencies, metadata) changes
+// the serial number, while identical content always yields the same serial.
+func deterministicSerialNumber(bom *cyclonedx.BOM) string {
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(bom); err != nil {
+		return uuid.Nil.URN()
+	}
+
+	return uuid.NewSHA1(cdxNamespace, buf.Bytes()).URN()
+}
+
+// nodeCapacityProperties appends capacity/allocatable properties only when the
+// corresponding data is present. Older KBOM snapshots may have nil capacity,
+// which must not break the conversion.
+func nodeCapacityProperties(properties []cyclonedx.Property, prefix string, capacity *model.Capacity) []cyclonedx.Property {
+	if capacity == nil {
+		return properties
+	}
+
+	return append(properties,
+		cyclonedx.Property{
+			Name:  RADPrefix + "k8s:node:" + prefix + ":cpu",
+			Value: capacity.CPU,
+		},
+		cyclonedx.Property{
+			Name:  RADPrefix + "k8s:node:" + prefix + ":memory",
+			Value: capacity.Memory,
+		},
+		cyclonedx.Property{
+			Name:  RADPrefix + "k8s:node:" + prefix + ":pods",
+			Value: capacity.Pods,
+		},
+		cyclonedx.Property{
+			Name:  RADPrefix + "k8s:node:" + prefix + ":ephemeralStorage",
+			Value: capacity.EphemeralStorage,
+		},
+	)
+}
+
+func lessComponent(a, b cyclonedx.Component) int {
+	switch {
+	case a.BOMRef < b.BOMRef:
+		return -1
+	case a.BOMRef > b.BOMRef:
+		return 1
+	case a.Type < b.Type:
+		return -1
+	case a.Type > b.Type:
+		return 1
+	case a.Name < b.Name:
+		return -1
+	case a.Name > b.Name:
+		return 1
+	default:
+		return 0
+	}
+}
+
 func transformToCycloneDXBOM(kbom *model.KBOM) *cyclonedx.BOM { //nolint:funlen
 	cdxBOM := cyclonedx.NewBOM()
 
-	cdxBOM.SerialNumber = uuid.New().URN()
 	cdxBOM.Metadata = &cyclonedx.Metadata{
-		Timestamp: time.Now().Format(time.RFC3339),
+		Timestamp: deterministicTimestamp(kbom),
 		Tools: &cyclonedx.ToolsChoice{
 			Components: &[]cyclonedx.Component{
 				{
@@ -115,96 +193,68 @@ func transformToCycloneDXBOM(kbom *model.KBOM) *cyclonedx.BOM { //nolint:funlen
 	for i := range kbom.Cluster.Nodes {
 		n := kbom.Cluster.Nodes[i]
 		bomRef := id(n)
-		components = append(components, cyclonedx.Component{
-			BOMRef: bomRef,
-			Type:   cyclonedx.ComponentTypePlatform,
-			Name:   n.Name,
-			Properties: &[]cyclonedx.Property{
-				{
-					Name:  CdxPrefix + K8sComponentType,
-					Value: NodeType,
-				},
-				{
-					Name:  CdxPrefix + K8sComponentName,
-					Value: n.Name,
-				},
-				{
-					Name:  RADPrefix + "k8s:node:osImage",
-					Value: n.OsImage,
-				},
-				{
-					Name:  RADPrefix + "k8s:node:arch",
-					Value: n.Architecture,
-				},
-				{
-					Name:  RADPrefix + "k8s:node:kernel",
-					Value: n.KernelVersion,
-				},
-				{
-					Name:  RADPrefix + "k8s:node:bootId",
-					Value: n.BootID,
-				},
-				{
-					Name:  RADPrefix + "k8s:node:type",
-					Value: n.Type,
-				},
-				{
-					Name:  RADPrefix + "k8s:node:operatingSystem",
-					Value: n.OperatingSystem,
-				},
-				{
-					Name:  RADPrefix + "k8s:node:machineId",
-					Value: n.MachineID,
-				},
-				{
-					Name:  RADPrefix + "k8s:node:hostname",
-					Value: n.Hostname,
-				},
-				{
-					Name:  RADPrefix + "k8s:node:containerRuntimeVersion",
-					Value: n.ContainerRuntimeVersion,
-				},
-				{
-					Name:  RADPrefix + "k8s:node:kubeletVersion",
-					Value: n.KubeletVersion,
-				},
-				{
-					Name:  RADPrefix + "k8s:node:kubeProxyVersion",
-					Value: n.KubeProxyVersion,
-				},
-				{
-					Name:  RADPrefix + "k8s:node:capacity:cpu",
-					Value: n.Capacity.CPU,
-				},
-				{
-					Name:  RADPrefix + "k8s:node:capacity:memory",
-					Value: n.Capacity.Memory,
-				},
-				{
-					Name:  RADPrefix + "k8s:node:capacity:pods",
-					Value: n.Capacity.Pods,
-				},
-				{
-					Name:  RADPrefix + "k8s:node:capacity:ephemeralStorage",
-					Value: n.Capacity.EphemeralStorage,
-				},
-				{
-					Name:  RADPrefix + "k8s:node:allocatable:cpu",
-					Value: n.Allocatable.CPU,
-				},
-				{
-					Name:  RADPrefix + "k8s:node:allocatable:memory",
-					Value: n.Allocatable.Memory,
-				},
-				{
-					Name:  RADPrefix + "k8s:node:allocatable:pods",
-					Value: n.Allocatable.Pods,
-				},
-				{
-					Name:  RADPrefix + "k8s:node:allocatable:ephemeralStorage",
-					Value: n.Allocatable.EphemeralStorage,
-				},
+		nodeProperties := []cyclonedx.Property{
+			{
+				Name:  CdxPrefix + K8sComponentType,
+				Value: NodeType,
 			},
+			{
+				Name:  CdxPrefix + K8sComponentName,
+				Value: n.Name,
+			},
+			{
+				Name:  RADPrefix + "k8s:node:osImage",
+				Value: n.OsImage,
+			},
+			{
+				Name:  RADPrefix + "k8s:node:arch",
+				Value: n.Architecture,
+			},
+			{
+				Name:  RADPrefix + "k8s:node:kernel",
+				Value: n.KernelVersion,
+			},
+			{
+				Name:  RADPrefix + "k8s:node:bootId",
+				Value: n.BootID,
+			},
+			{
+				Name:  RADPrefix + "k8s:node:type",
+				Value: n.Type,
+			},
+			{
+				Name:  RADPrefix + "k8s:node:operatingSystem",
+				Value: n.OperatingSystem,
+			},
+			{
+				Name:  RADPrefix + "k8s:node:machineId",
+				Value: n.MachineID,
+			},
+			{
+				Name:  RADPrefix + "k8s:node:hostname",
+				Value: n.Hostname,
+			},
+			{
+				Name:  RADPrefix + "k8s:node:containerRuntimeVersion",
+				Value: n.ContainerRuntimeVersion,
+			},
+			{
+				Name:  RADPrefix + "k8s:node:kubeletVersion",
+				Value: n.KubeletVersion,
+			},
+			{
+				Name:  RADPrefix + "k8s:node:kubeProxyVersion",
+				Value: n.KubeProxyVersion,
+			},
+		}
+		nodeProperties = nodeCapacityProperties(nodeProperties, "capacity", n.Capacity)
+		nodeProperties = nodeCapacityProperties(nodeProperties, "allocatable", n.Allocatable)
+
+		components = append(components, cyclonedx.Component{
+			BOMRef:     bomRef,
+			Type:       cyclonedx.ComponentTypePlatform,
+			Name:       n.Name,
+			Properties: &nodeProperties,
 		})
 		clusterDependencies[bomRef] = bomRef
 	}
@@ -277,6 +327,7 @@ func transformToCycloneDXBOM(kbom *model.KBOM) *cyclonedx.BOM { //nolint:funlen
 				addonImages = append(addonImages, ref)
 			}
 		}
+		slices.Sort(addonImages)
 		if len(addonImages) > 0 {
 			dependencies = append(dependencies, cyclonedx.Dependency{
 				Ref:          bomRef,
@@ -337,6 +388,10 @@ func transformToCycloneDXBOM(kbom *model.KBOM) *cyclonedx.BOM { //nolint:funlen
 		}
 	}
 
+	slices.SortFunc(components, func(a, b cyclonedx.Component) int {
+		return lessComponent(a, b)
+	})
+
 	clusterDependenciesArr := make([]string, 0)
 	for _, dep := range clusterDependencies {
 		clusterDependenciesArr = append(clusterDependenciesArr, dep)
@@ -349,9 +404,13 @@ func transformToCycloneDXBOM(kbom *model.KBOM) *cyclonedx.BOM { //nolint:funlen
 			Dependencies: &clusterDependenciesArr,
 		},
 	)
+	slices.SortFunc(dependencies, func(a, b cyclonedx.Dependency) int {
+		return strings.Compare(a.Ref, b.Ref)
+	})
 
 	cdxBOM.Components = &components
 	cdxBOM.Dependencies = &dependencies
+	cdxBOM.SerialNumber = deterministicSerialNumber(cdxBOM)
 
 	return cdxBOM
 }
